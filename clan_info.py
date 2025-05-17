@@ -5,12 +5,16 @@ from airflow.providers.postgres.operators.postgres import PostgresOperator
 from airflow.decorators import python_task, branch_task
 from airflow.operators.bash import BashOperator
 from airflow.utils.task_group import TaskGroup
+from airflow.exceptions import AirflowFailException
 import pandas as pd
 import json
 import psycopg2
 import gspread
+import requests
 
 
+EMAIL = '<your email>'
+PASSWORD = '<your_password>'
 PATH = '<...>/dags/clan/'
 csv_files = ['members', 'raids_attacks', 'raids', 'unattacked_players']
 sheet_file_id = "<your_file_id>"
@@ -39,6 +43,11 @@ info_type = {
 def get_last_raid_id(cursor):
     cursor.execute("SELECT last_value from raid_id;")
     return cursor.fetchall()[0][0]
+
+
+def get_ip():
+    ip_request = requests.get("https://ip.me/")
+    return ip_request.text.replace("\n", "")
 
 
 with DAG(
@@ -76,6 +85,56 @@ with DAG(
                     f"{url} > $AIRFLOW_HOME/dags/clan/json/{name}.json"
                 )
             )
+
+    # Creating TOKEN if needed and push it to XCom
+    @python_task(task_id='create_token', provide_context=True, templates_dict={"path": PATH})
+    def login_and_generate_a_token():
+        s = requests.Session()
+
+        log_in = {
+            'email': EMAIL,
+            'password': PASSWORD
+        }
+        # authorize to clash of clans api
+        response = s.post(
+            "https://developer.clashofclans.com/api/login",
+            json=log_in
+        ).json()
+        if response['status']['message'] != "ok":
+            raise AirflowFailException('Failed login: ' + response['status']['message'])
+
+        # getting all keys
+        ip_adress = get_ip()
+        response = s.post('https://developer.clashofclans.com/api/apikey/list') \
+                    .json()
+        if response['status']['message'] != 'ok':
+            raise AirflowFailException('Failed to get keys: ' + response['status']['message'])
+
+        all_keys = response['keys']
+
+        # if find ip match, return key, else delete it
+        for key in all_keys:
+            if ip_adress in key["cidrRanges"]:
+                return key["key"]
+            else:
+                s.post(
+                    'https://developer.clashofclans.com/api/apikey/revoke',
+                    json={"id": key["id"]}
+                )
+
+        # creating new key for new current ip
+        creating_key_payload = {
+            'name': 'api from python',
+            'description': 'created at ' + str(datetime.now()),
+            'cidrRanges': ip_adress
+        }
+        response = s.post(
+            'https://developer.clashofclans.com/api/apikey/create',
+            json=creating_key_payload).json()
+        if response['status']['message'] != 'ok':
+            raise AirflowFailException('Failed to create a new key: ' + response['status']['message'])
+
+        return response['key']['key']
 
     # Changing to Moscow timezone
     @python_task(task_id='cut_raid_json_part', templates_dict={"path": PATH})
@@ -308,9 +367,11 @@ with DAG(
         [add_and_update_raid, update_raid_info, end_raid_if_need] >> c_sql_raids
         c_sql_raids >> updating_raid_attacks >> unattacked_update >> upload_raids
 
+    create_token = login_and_generate_a_token()
     cut_raid_json = cut_raid_json_part()
 
-    task_start >> loading_json_files
+    task_start >> create_token
+    create_token >> loading_json_files
     loading_json_files >> cut_raid_json
     cut_raid_json >> working_with_members
     cut_raid_json >> working_with_raids
